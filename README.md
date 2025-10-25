@@ -1,2 +1,3 @@
 # OI-base
-me doing some OI
+Just some OI algorithms and Data Structures
+
