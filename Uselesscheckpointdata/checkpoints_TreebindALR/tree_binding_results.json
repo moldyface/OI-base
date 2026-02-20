@@ -1,0 +1,104 @@
+{
+  "test_accuracy": 97.23,
+  "ensemble_accuracy": 96.68,
+  "tree_best_accuracy": 98.265625,
+  "tree_generations": 7,
+  "tree_config": {
+    "num_models": 6,
+    "keep_top": 2,
+    "mutation_rate": 0.3,
+    "mutation_strength": 0.1,
+    "lr_adjust_factor": 0.8,
+    "lr_adjust_threshold": 1.0
+  },
+  "model_config": {
+    "layer_sizes": [
+      784,
+      128,
+      128,
+      128,
+      10
+    ],
+    "activations": [
+      "relu",
+      "relu",
+      "relu",
+      null
+    ]
+  },
+  "main_model_lr_ratios": [
+    1.0,
+    0.8,
+    0.6,
+    0.4
+  ],
+  "main_model_base_lr": 0.001,
+  "population_stats": {
+    "size": 6,
+    "avg_accuracy": 32.7421875,
+    "best_accuracy": 98.25,
+    "worst_accuracy": 0.0,
+    "avg_lr_adjustments": 0.0,
+    "avg_base_lr": 0.0008160809199487563,
+    "origins": [
+      "elite_gen_6",
+      "elite_gen_6",
+      "mutated_gen_6",
+      "mutated_gen_6",
+      "mutated_gen_6",
+      "mutated_gen_6"
+    ],
+    "total_lr_adjustments": 6
+  },
+  "lr_adjustment_history": [
+    {
+      "generation": 1,
+      "model_id": 8,
+      "adjustment_type": "decrease",
+      "factor": 0.8,
+      "accuracy": 96.9375,
+      "previous_accuracy": 0.0
+    },
+    {
+      "generation": 2,
+      "model_id": 16,
+      "adjustment_type": "decrease",
+      "factor": 0.8,
+      "accuracy": 96.5,
+      "previous_accuracy": 0.0
+    },
+    {
+      "generation": 2,
+      "model_id": 17,
+      "adjustment_type": "decrease",
+      "factor": 0.8,
+      "accuracy": 96.5,
+      "previous_accuracy": 0.0
+    },
+    {
+      "generation": 3,
+      "model_id": 22,
+      "adjustment_type": "decrease",
+      "factor": 0.8,
+      "accuracy": 97.0625,
+      "previous_accuracy": 0.0
+    },
+    {
+      "generation": 4,
+      "model_id": 27,
+      "adjustment_type": "decrease",
+      "factor": 0.8,
+      "accuracy": 97.15625,
+      "previous_accuracy": 0.0
+    },
+    {
+      "generation": 4,
+      "model_id": 28,
+      "adjustment_type": "decrease",
+      "factor": 0.8,
+      "accuracy": 97.109375,
+      "previous_accuracy": 0.0
+    }
+  ],
+  "timestamp": "2026-01-22 11:28:00"
+}

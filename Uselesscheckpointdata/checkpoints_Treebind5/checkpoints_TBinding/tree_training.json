@@ -1,0 +1,19 @@
+{
+  "epoch": 0,
+  "regular_model_accuracy": 92.75833333333334,
+  "tree_generation": 1,
+  "tree_best_accuracy": 93.45833333333333,
+  "tree_history": [
+    {
+      "generation": 0,
+      "best_accuracy": 93.45833333333333,
+      "avg_accuracy": 92.57166666666667,
+      "top_3_accuracies": [
+        93.45833333333333,
+        93.24166666666666,
+        93.025
+      ]
+    }
+  ],
+  "timestamp": "2026-01-02 12:18:49"
+}

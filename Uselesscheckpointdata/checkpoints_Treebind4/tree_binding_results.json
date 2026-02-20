@@ -1,0 +1,26 @@
+{
+  "test_accuracy": 97.01,
+  "ensemble_accuracy": 97.12,
+  "tree_best_accuracy": 97.6875,
+  "tree_generations": 11,
+  "tree_config": {
+    "num_models": 4,
+    "keep_top": 2,
+    "mutation_rate": 0.25,
+    "mutation_strength": 0.05
+  },
+  "model_config": {
+    "layer_sizes": [
+      784,
+      128,
+      64,
+      10
+    ],
+    "activations": [
+      "relu",
+      "relu",
+      null
+    ]
+  },
+  "timestamp": "2026-01-03 18:42:49"
+}

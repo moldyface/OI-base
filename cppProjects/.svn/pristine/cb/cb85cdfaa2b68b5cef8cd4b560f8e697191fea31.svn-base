@@ -1,0 +1,1215 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import os
+import json
+import copy
+import random
+import numpy as np
+from datetime import datetime
+from scipy import signal
+
+# ======================
+# CONFIGURATION
+# ======================
+CHECKPOINT_DIR = "./checkpoints_Treebind_Augmented2"
+TREE_BINDING_DIR = "./tree_binding_data_Augmented2"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(TREE_BINDING_DIR, exist_ok=True)
+
+# Tree Binding Configuration with backtracking and aggressive plateau handling
+TREE_CONFIG = {
+    'num_models': 15,
+    'keep_top': 3,
+    'mutation_rate': 0.3,
+    'mutation_strength': 0.1,
+    
+    # LR Configuration
+    'base_lr_range': [0.0005, 0.002],  # Range for initial base LRs
+    'min_lr': 1e-6,
+    'max_lr': 0.01,
+    
+    # Backtracking Configuration
+    'backtracking_enabled': True,
+    'backtrack_generations': 2,  # Look back 2 generations for backtracking
+    'backtracking_threshold': 0.3,  # Accuracy drop threshold for backtracking
+    'backtracking_lr_factor': 0.5,  # DECREASE LR by this factor during backtracking
+    
+    # Aggressive Plateau Handling
+    'plateau_patience': 3,  # Generations before aggressive action
+    'plateau_aggressive_factor': 2.0,  # How aggressive to increase LR
+    'plateau_mutation_boost': 2.0,  # Boost mutation when stuck
+    
+    # Mutation Strategies
+    'normal_mutation_rate': 0.3,
+    'aggressive_mutation_rate': 0.6,
+    'normal_mutation_strength': 0.1,
+    'aggressive_mutation_strength': 0.2,
+    
+    # Exploration
+    'exploration_rate': 0.1,
+}
+
+class CheckpointManager:
+    """Manages saving and loading checkpoints"""
+    def __init__(self, checkpoint_dir=CHECKPOINT_DIR):
+        self.checkpoint_dir = checkpoint_dir
+        self.best_accuracy = 0
+        self.checkpoint_path = os.path.join(checkpoint_dir, "best_model.pth")
+        self.stats_path = os.path.join(checkpoint_dir, "training_stats.json")
+        
+    def save_checkpoint(self, model, optimizer, epoch, train_losses, val_accuracy, 
+                        model_config=None, is_best=False):
+        """Save model checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'train_losses': train_losses,
+            'val_accuracy': val_accuracy,
+            'model_config': model_config or {},
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # Save optimizer state if it has state_dict method
+        if hasattr(optimizer, 'state_dict'):
+            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+        
+        # Always save current checkpoint
+        torch.save(checkpoint, os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch}.pth"))
+        
+        # Save as best if accuracy improved
+        if is_best:
+            torch.save(checkpoint, self.checkpoint_path)
+            self.best_accuracy = val_accuracy
+            print(f"✓ New best model saved with accuracy: {val_accuracy:.2f}%")
+    
+    def load_checkpoint(self, model, optimizer=None, ignore_optimizer=False):
+        """Load the best checkpoint, handling different optimizer types"""
+        if os.path.exists(self.checkpoint_path):
+            checkpoint = torch.load(self.checkpoint_path, map_location='cpu')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            if optimizer and 'optimizer_state_dict' in checkpoint and not ignore_optimizer:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print(f"✓ Loaded optimizer state from checkpoint")
+                except Exception as e:
+                    print(f"⚠️ Could not load optimizer state: {e}")
+                    print(f"  Starting with fresh optimizer")
+            
+            print(f"✓ Loaded checkpoint from epoch {checkpoint['epoch']}")
+            print(f"  Previous accuracy: {checkpoint['val_accuracy']:.2f}%")
+            print(f"  Saved on: {checkpoint['timestamp']}")
+            
+            return checkpoint
+        return None
+
+class BacktrackingLROptimizer:
+    """LR Optimizer with backtracking and plateau awareness"""
+    def __init__(self, model, base_lr=None, lr_ratios=None, config=TREE_CONFIG):
+        self.model = model
+        self.config = config
+        
+        # Set base LR if not provided
+        if base_lr is None:
+            base_lr = random.uniform(config['base_lr_range'][0], config['base_lr_range'][1])
+        
+        # Default learning rate ratios
+        if lr_ratios is None:
+            linear_layers = [module for module in model.modules() 
+                           if isinstance(module, nn.Linear)]
+            lr_ratios = [1.0 / (i + 1) for i in range(len(linear_layers))]
+            lr_ratios = [ratio / lr_ratios[0] for ratio in lr_ratios]
+        
+        # Create parameter groups
+        self.param_groups_list = []
+        for idx, (name, param) in enumerate(model.named_parameters()):
+            if 'weight' in name or 'bias' in name:
+                layer_idx = self._get_layer_index(name, len(lr_ratios))
+                initial_lr = base_lr * lr_ratios[layer_idx]
+                
+                self.param_groups_list.append({
+                    'params': param,
+                    'lr': initial_lr,
+                    'name': name,
+                    'layer': layer_idx,
+                    'base_ratio': lr_ratios[layer_idx],
+                    'original_lr': initial_lr,
+                    'lr_history': [initial_lr],  # Track LR changes
+                })
+        
+        # Create optimizer
+        self.optimizer = optim.AdamW(self.param_groups_list, weight_decay=1e-4)
+        
+        # State tracking
+        self.base_lr = base_lr
+        self.lr_ratios = lr_ratios
+        self.accuracy_history = []
+        self.best_accuracy = 0
+        self.plateau_counter = 0
+        self.aggressive_mode = False
+        self.backtrack_triggered = False
+        
+        print(f"\nBacktracking LR Optimizer:")
+        print(f"  Base LR: {base_lr:.6f}")
+        print(f"  LR Ratios: {lr_ratios}")
+        print(f"  Aggressive Mode: {self.aggressive_mode}")
+    
+    def _get_layer_index(self, param_name, max_layers):
+        for i in range(max_layers):
+            if f'{i}.' in param_name:
+                return i
+        return 0
+    
+    def zero_grad(self, set_to_none=True):
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+    
+    def step(self):
+        self.optimizer.step()
+    
+    def state_dict(self):
+        return {
+            'optimizer_state': self.optimizer.state_dict(),
+            'base_lr': self.base_lr,
+            'lr_ratios': self.lr_ratios,
+            'accuracy_history': self.accuracy_history,
+            'best_accuracy': self.best_accuracy,
+            'aggressive_mode': self.aggressive_mode,
+        }
+    
+    def load_state_dict(self, state_dict):
+        if 'optimizer_state' in state_dict:
+            self.optimizer.load_state_dict(state_dict['optimizer_state'])
+        if 'base_lr' in state_dict:
+            self.base_lr = state_dict['base_lr']
+        if 'lr_ratios' in state_dict:
+            self.lr_ratios = state_dict['lr_ratios']
+        if 'accuracy_history' in state_dict:
+            self.accuracy_history = state_dict['accuracy_history']
+        if 'best_accuracy' in state_dict:
+            self.best_accuracy = state_dict['best_accuracy']
+        if 'aggressive_mode' in state_dict:
+            self.aggressive_mode = state_dict['aggressive_mode']
+    
+    def get_lr_info(self):
+        return {group['name']: group['lr'] for group in self.param_groups_list}
+    
+    def update_performance(self, current_accuracy):
+        """Update performance tracking and detect plateaus"""
+        self.accuracy_history.append(current_accuracy)
+        if len(self.accuracy_history) > 20:
+            self.accuracy_history.pop(0)
+        
+        # Update best accuracy
+        if current_accuracy > self.best_accuracy:
+            self.best_accuracy = current_accuracy
+            self.plateau_counter = 0  # Reset plateau counter on improvement
+        else:
+            self.plateau_counter += 1
+        
+        # Check if we need aggressive mode
+        if self.plateau_counter >= self.config['plateau_patience']:
+            if not self.aggressive_mode:
+                self.enter_aggressive_mode()
+    
+    def enter_aggressive_mode(self):
+        """Enter aggressive learning mode (INCREASE LRs)"""
+        self.aggressive_mode = True
+        print(f"  ⚡ Entering AGGRESSIVE MODE due to plateau")
+        
+        # Increase all learning rates aggressively
+        old_base_lr = self.base_lr
+        self.base_lr = min(
+            self.base_lr * self.config['plateau_aggressive_factor'],
+            self.config['max_lr']
+        )
+        
+        # Apply to all parameter groups
+        for group in self.param_groups_list:
+            old_lr = group['lr']
+            new_lr = min(
+                old_lr * self.config['plateau_aggressive_factor'],
+                self.config['max_lr']
+            )
+            group['lr'] = new_lr
+            group['lr_history'].append(new_lr)
+        
+        print(f"  ↳ Base LR increased from {old_base_lr:.6f} to {self.base_lr:.6f}")
+    
+    def exit_aggressive_mode(self):
+        """Exit aggressive mode (called when improvement resumes)"""
+        if self.aggressive_mode:
+            self.aggressive_mode = False
+            print(f"  ↪ Exiting aggressive mode")
+    
+    def apply_backtracking_adjustment(self, previous_best_accuracy, current_best_accuracy):
+        """Apply backtracking adjustments if performance declined - DECREASE LRs"""
+        accuracy_drop = previous_best_accuracy - current_best_accuracy
+        
+        if accuracy_drop > self.config['backtracking_threshold']:
+            self.backtrack_triggered = True
+            print(f"  🔙 BACKTRACKING triggered: Accuracy dropped {accuracy_drop:.2f}%")
+            
+            # DECREASE learning rates for careful adjustments
+            old_base_lr = self.base_lr
+            self.base_lr = max(
+                self.base_lr * self.config['backtracking_lr_factor'],
+                self.config['min_lr']
+            )
+            
+            # Apply to all parameter groups
+            for group in self.param_groups_list:
+                old_lr = group['lr']
+                new_lr = max(
+                    old_lr * self.config['backtracking_lr_factor'],
+                    self.config['min_lr']
+                )
+                group['lr'] = new_lr
+                group['lr_history'].append(new_lr)
+            
+            print(f"  ↳ Base LR decreased from {old_base_lr:.6f} to {self.base_lr:.6f}")
+            return True
+        return False
+    
+    def reset_tracking(self):
+        """Reset tracking (useful when model weights are replaced)"""
+        self.plateau_counter = 0
+        self.aggressive_mode = False
+        self.accuracy_history = []
+
+class BacktrackingTreeBindingManager:
+    """Tree Binding Manager with backtracking and aggressive plateau handling"""
+    def __init__(self, base_model, config=TREE_CONFIG):
+        self.config = config
+        self.base_model = base_model
+        self.population = []
+        self.generation = 0
+        self.best_accuracy = 0
+        self.best_model = None
+        self.next_id = 0
+        
+        # Backtracking history
+        self.generation_history = []  # Store best accuracy per generation
+        self.best_population_history = []  # Store top models from each generation
+        self.backtrack_count = 0
+        
+        # Plateau tracking
+        self.plateau_generations = 0
+        self.aggressive_evolution_active = False
+        
+    def initialize_population(self):
+        """Initialize population with diverse models"""
+        print(f"\nInitializing Tree Binding with {self.config['num_models']} models...")
+        
+        self.population = []
+        self.next_id = 0
+        
+        for i in range(self.config['num_models']):
+            model = copy.deepcopy(self.base_model)
+            
+            # Add weight variations
+            if i > 0:
+                model_state = model.state_dict()
+                for key in model_state:
+                    if 'weight' in key or 'bias' in key:
+                        model_state[key] += torch.randn_like(model_state[key]) * 0.01
+                model.load_state_dict(model_state)
+            
+            # Diverse LR configurations
+            lr_configs = [
+                [1.0, 0.8, 0.6, 0.4],    # Decreasing
+                [0.4, 0.6, 0.8, 1.0],    # Increasing
+                [1.0, 0.5, 0.25, 0.125], # Steep decreasing
+                [0.125, 0.25, 0.5, 1.0], # Steep increasing
+                [1.0, 1.0, 1.0, 1.0],    # Uniform
+                [0.5, 1.0, 0.5, 1.0],    # Alternating
+                [1.0, 0.9, 0.7, 0.3],    # Fast early learning
+                [0.3, 0.7, 0.9, 1.0],    # Fast late learning
+            ]
+            
+            lr_ratios = random.choice(lr_configs)
+            base_lr = random.uniform(self.config['base_lr_range'][0], 
+                                   self.config['base_lr_range'][1])
+            
+            optimizer = BacktrackingLROptimizer(model, base_lr=base_lr, 
+                                               lr_ratios=lr_ratios, config=self.config)
+            
+            self.population.append({
+                'model': model,
+                'optimizer': optimizer,
+                'accuracy': 0.0,
+                'id': self.next_id,
+                'base_lr': base_lr,
+                'lr_ratios': lr_ratios,
+                'origin': 'initial',
+                'generation': 0,
+            })
+            self.next_id += 1
+        
+        print(f"✓ Created {len(self.population)} initial models")
+    
+    def train_population_fast(self, train_loader, criterion):
+        """Train all models"""
+        print(f"\n[Tree Binding] Training Generation {self.generation + 1}...")
+        
+        batches_to_train = 200
+        
+        for idx, model_info in enumerate(self.population):
+            model = model_info['model']
+            optimizer = model_info['optimizer']
+            
+            model.train()
+            batch_iter = iter(train_loader)
+            
+            for batch_idx in range(batches_to_train):
+                try:
+                    images, labels = next(batch_iter)
+                except StopIteration:
+                    batch_iter = iter(train_loader)
+                    images, labels = next(batch_iter)
+                
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                
+                if idx == 0 and batch_idx % 50 == 0:
+                    current_lrs = list(optimizer.get_lr_info().values())
+                    avg_lr = sum(current_lrs) / len(current_lrs)
+                    mode = "⚡" if optimizer.aggressive_mode else "○"
+                    print(f'  {mode} Model 1, Batch [{batch_idx}/{batches_to_train}], Loss: {loss.item():.4f}, Avg LR: {avg_lr:.6f}')
+        
+        print(f"  ✓ Trained all models")
+    
+    def evaluate_population(self, val_loader, criterion):
+        """Evaluate all models and update performance tracking"""
+        print("\n[Tree Binding] Evaluating models...")
+        
+        for model_info in self.population:
+            model = model_info['model']
+            optimizer = model_info['optimizer']
+            
+            model.eval()
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                batch_iter = iter(val_loader)
+                for i in range(50):
+                    try:
+                        images, labels = next(batch_iter)
+                        outputs = model(images)
+                        _, predicted = torch.max(outputs.data, 1)
+                        total += labels.size(0)
+                        correct += (predicted == labels).sum().item()
+                    except StopIteration:
+                        break
+            
+            accuracy = 100 * correct / total if total > 0 else 0
+            model_info['accuracy'] = accuracy
+            
+            # Update optimizer's performance tracking
+            optimizer.update_performance(accuracy)
+        
+        # Sort by accuracy
+        self.population.sort(key=lambda x: x['accuracy'], reverse=True)
+        
+        # Update generation history
+        current_best = self.population[0]['accuracy']
+        self.generation_history.append({
+            'generation': self.generation,
+            'best_accuracy': current_best,
+            'avg_accuracy': sum(m['accuracy'] for m in self.population) / len(self.population),
+            'timestamp': datetime.now().strftime("%H:%M:%S")
+        })
+        
+        # Store top models for potential backtracking
+        if len(self.best_population_history) < self.config['backtrack_generations']:
+            self.best_population_history.append(copy.deepcopy(self.population[:self.config['keep_top']]))
+        else:
+            self.best_population_history.pop(0)
+            self.best_population_history.append(copy.deepcopy(self.population[:self.config['keep_top']]))
+        
+        # Update best model
+        if current_best > self.best_accuracy:
+            self.best_accuracy = current_best
+            self.best_model = copy.deepcopy(self.population[0]['model'])
+            print(f"  🎯 New Tree Binding Best: {current_best:.2f}%")
+            self.plateau_generations = 0  # Reset plateau counter
+            
+            # Exit aggressive mode if we're in it
+            if self.aggressive_evolution_active:
+                self.aggressive_evolution_active = False
+                print(f"  ↪ Exiting aggressive evolution mode")
+        else:
+            self.plateau_generations += 1
+            if self.plateau_generations >= self.config['plateau_patience']:
+                self.activate_aggressive_evolution()
+        
+        # Show results
+        print(f"\n  Top {min(3, len(self.population))} models:")
+        for i in range(min(3, len(self.population))):
+            model_info = self.population[i]
+            mode = "⚡" if model_info['optimizer'].aggressive_mode else "○"
+            print(f"    #{i+1}: {mode} Model {model_info['id']} = {model_info['accuracy']:.2f}% | LR: {model_info['base_lr']:.5f}")
+        
+        # Show worst model
+        if len(self.population) > 0:
+            worst_model = self.population[-1]
+            mode = "⚡" if worst_model['optimizer'].aggressive_mode else "○"
+            print(f"  Worst: {mode} Model {worst_model['id']} = {worst_model['accuracy']:.2f}%")
+        
+        return current_best
+    
+    def activate_aggressive_evolution(self):
+        """Activate aggressive evolution when stuck in plateau"""
+        if not self.aggressive_evolution_active:
+            self.aggressive_evolution_active = True
+            print(f"\n  ⚡ ACTIVATING AGGRESSIVE EVOLUTION (plateau for {self.plateau_generations} gens)")
+            
+            # Force all optimizers into aggressive mode
+            for model_info in self.population:
+                model_info['optimizer'].enter_aggressive_mode()
+    
+    def evolve_population_with_backtracking(self):
+        """Evolve population with backtracking capability"""
+        print(f"\n[Tree Binding] Evolving to Generation {self.generation + 2}...")
+        
+        # Check if we should backtrack
+        should_backtrack = False
+        backtrack_info = None
+        
+        if (self.config['backtracking_enabled'] and 
+            len(self.generation_history) >= 2 and
+            len(self.best_population_history) >= 1):
+            
+            current_best = self.population[0]['accuracy']
+            
+            # Look back to find best generation in recent history
+            best_historical_accuracy = 0
+            best_historical_generation = -1
+            
+            for i, gen_data in enumerate(self.generation_history[-self.config['backtrack_generations']:]):
+                if gen_data['best_accuracy'] > best_historical_accuracy:
+                    best_historical_accuracy = gen_data['best_accuracy']
+                    best_historical_generation = gen_data['generation']
+            
+            # Check if current generation is worse
+            if current_best < best_historical_accuracy - self.config['backtracking_threshold']:
+                should_backtrack = True
+                backtrack_info = {
+                    'current_gen': self.generation,
+                    'best_historical_gen': best_historical_generation,
+                    'current_best': current_best,
+                    'historical_best': best_historical_accuracy,
+                    'drop': best_historical_accuracy - current_best
+                }
+        
+        # Choose evolution strategy
+        if should_backtrack:
+            return self._backtrack_evolution(backtrack_info)
+        elif self.aggressive_evolution_active:
+            return self._aggressive_evolution()
+        else:
+            return self._normal_evolution()
+    
+    def _normal_evolution(self):
+        """Normal evolution: keep top 3, generate new ones"""
+        print(f"  Strategy: Normal evolution")
+        
+        top_models = self.population[:self.config['keep_top']]
+        new_population = []
+        
+        # Keep top models
+        for top in top_models:
+            model_copy = copy.deepcopy(top['model'])
+            optimizer = BacktrackingLROptimizer(
+                model_copy, 
+                base_lr=top['base_lr'], 
+                lr_ratios=top['lr_ratios'], 
+                config=self.config
+            )
+            
+            new_population.append({
+                'model': model_copy,
+                'optimizer': optimizer,
+                'accuracy': top['accuracy'],
+                'id': self.next_id,
+                'base_lr': top['base_lr'],
+                'lr_ratios': top['lr_ratios'],
+                'origin': f'elite_gen_{self.generation + 1}',
+                'generation': self.generation + 1,
+            })
+            self.next_id += 1
+        
+        # Generate new models with normal mutation
+        while len(new_population) < self.config['num_models']:
+            parent = random.choice(top_models)
+            child = self._create_mutated_child(
+                parent, 
+                mutation_rate=self.config['normal_mutation_rate'],
+                mutation_strength=self.config['normal_mutation_strength']
+            )
+            
+            new_population.append({
+                'model': child['model'],
+                'optimizer': child['optimizer'],
+                'accuracy': 0.0,
+                'id': self.next_id,
+                'base_lr': child['base_lr'],
+                'lr_ratios': child['lr_ratios'],
+                'origin': f'mutated_gen_{self.generation + 1}',
+                'generation': self.generation + 1,
+            })
+            self.next_id += 1
+        
+        self.population = new_population
+        self.generation += 1
+        
+        print(f"  ✓ Evolved: Kept top {len(top_models)}, created {len(new_population)-len(top_models)} new")
+        return True
+    
+    def _aggressive_evolution(self):
+        """Aggressive evolution: more aggressive mutations when stuck"""
+        print(f"  Strategy: AGGRESSIVE evolution (plateau detected)")
+        
+        top_models = self.population[:self.config['keep_top']]
+        new_population = []
+        
+        # Keep top models but with more aggressive LR
+        for top in top_models:
+            model_copy = copy.deepcopy(top['model'])
+            
+            # Use more aggressive base LR
+            aggressive_base_lr = min(
+                top['base_lr'] * self.config['plateau_aggressive_factor'],
+                self.config['max_lr']
+            )
+            
+            optimizer = BacktrackingLROptimizer(
+                model_copy, 
+                base_lr=aggressive_base_lr, 
+                lr_ratios=top['lr_ratios'], 
+                config=self.config
+            )
+            optimizer.enter_aggressive_mode()  # Force aggressive mode
+            
+            new_population.append({
+                'model': model_copy,
+                'optimizer': optimizer,
+                'accuracy': top['accuracy'],
+                'id': self.next_id,
+                'base_lr': aggressive_base_lr,
+                'lr_ratios': top['lr_ratios'],
+                'origin': f'aggressive_elite_gen_{self.generation + 1}',
+                'generation': self.generation + 1,
+            })
+            self.next_id += 1
+        
+        # Generate new models with aggressive mutation
+        while len(new_population) < self.config['num_models']:
+            parent = random.choice(top_models)
+            child = self._create_mutated_child(
+                parent, 
+                mutation_rate=self.config['aggressive_mutation_rate'],
+                mutation_strength=self.config['aggressive_mutation_strength']
+            )
+            
+            # Make child LR more aggressive
+            child_base_lr = min(
+                child['base_lr'] * 1.2,  # Slightly aggressive
+                self.config['max_lr']
+            )
+            child['optimizer'].base_lr = child_base_lr
+            child['optimizer'].enter_aggressive_mode()
+            
+            new_population.append({
+                'model': child['model'],
+                'optimizer': child['optimizer'],
+                'accuracy': 0.0,
+                'id': self.next_id,
+                'base_lr': child_base_lr,
+                'lr_ratios': child['lr_ratios'],
+                'origin': f'aggressive_mutated_gen_{self.generation + 1}',
+                'generation': self.generation + 1,
+            })
+            self.next_id += 1
+        
+        self.population = new_population
+        self.generation += 1
+        
+        print(f"  ✓ Aggressive evolution: Increased mutation rate and LRs")
+        return True
+    
+    def _backtrack_evolution(self, backtrack_info):
+        """Backtrack to previous best generation and create careful mutations with DECREASED LRs"""
+        print(f"  Strategy: BACKTRACKING evolution")
+        print(f"  Accuracy dropped {backtrack_info['drop']:.2f}% from gen {backtrack_info['best_historical_gen']}")
+        
+        self.backtrack_count += 1
+        
+        # Use models from best historical generation as base
+        if self.best_population_history:
+            historical_top_models = self.best_population_history[-1]  # Use most recent good generation
+        else:
+            historical_top_models = self.population[:self.config['keep_top']]
+        
+        new_population = []
+        
+        # Restore top models from historical best generation but with DECREASED LRs
+        for historical_model in historical_top_models:
+            model_copy = copy.deepcopy(historical_model['model'])
+            
+            # DECREASE LR for careful adjustments
+            careful_base_lr = max(
+                historical_model['base_lr'] * self.config['backtracking_lr_factor'],
+                self.config['min_lr']
+            )
+            
+            optimizer = BacktrackingLROptimizer(
+                model_copy, 
+                base_lr=careful_base_lr, 
+                lr_ratios=historical_model['lr_ratios'], 
+                config=self.config
+            )
+            
+            # Apply backtracking adjustment to decrease LR
+            optimizer.apply_backtracking_adjustment(
+                backtrack_info['historical_best'],
+                backtrack_info['current_best']
+            )
+            
+            new_population.append({
+                'model': model_copy,
+                'optimizer': optimizer,
+                'accuracy': historical_model['accuracy'],
+                'id': self.next_id,
+                'base_lr': careful_base_lr,
+                'lr_ratios': historical_model['lr_ratios'],
+                'origin': f'backtrack_elite_gen_{self.generation + 1}',
+                'generation': self.generation + 1,
+            })
+            self.next_id += 1
+        
+        # Create careful mutations from backtracked models with DECREASED LRs
+        while len(new_population) < self.config['num_models']:
+            parent = random.choice(historical_top_models)
+            
+            # Careful mutation (lower mutation rate for precision)
+            child = self._create_mutated_child(
+                parent, 
+                mutation_rate=0.15,  # Lower mutation rate for careful adjustments
+                mutation_strength=0.04  # Smaller mutations
+            )
+            
+            # DECREASE LR for careful exploration
+            child_base_lr = max(
+                child['base_lr'] * 0.8,  # Even more careful
+                self.config['min_lr']
+            )
+            child['optimizer'].base_lr = child_base_lr
+            
+            new_population.append({
+                'model': child['model'],
+                'optimizer': child['optimizer'],
+                'accuracy': 0.0,
+                'id': self.next_id,
+                'base_lr': child_base_lr,
+                'lr_ratios': child['lr_ratios'],
+                'origin': f'backtrack_careful_gen_{self.generation + 1}',
+                'generation': self.generation + 1,
+            })
+            self.next_id += 1
+        
+        self.population = new_population
+        self.generation += 1
+        self.aggressive_evolution_active = False  # Reset aggressive mode
+        
+        print(f"  ✓ Backtracking evolution: Restored from gen {backtrack_info['best_historical_gen']}")
+        print(f"  ↳ Created careful mutations with DECREASED LRs for precise adjustments")
+        return True
+    
+    def _create_mutated_child(self, parent, mutation_rate, mutation_strength):
+        """Create a mutated child from parent"""
+        child = copy.deepcopy(parent['model'])
+        
+        # Apply mutation
+        with torch.no_grad():
+            child_state = child.state_dict()
+            for key in child_state:
+                if 'weight' in key or 'bias' in key:
+                    mask = torch.rand_like(child_state[key]) < mutation_rate
+                    if mask.any():
+                        noise = torch.randn_like(child_state[key]) * mutation_strength
+                        child_state[key] = child_state[key] + noise * mask.float()
+            child.load_state_dict(child_state)
+        
+        # Mutate LR configuration
+        lr_ratios = parent['lr_ratios'].copy()
+        
+        # With moderate probability, change LR pattern
+        if random.random() < 0.4:
+            lr_patterns = [
+                [1.0, 0.8, 0.6, 0.4],
+                [0.4, 0.6, 0.8, 1.0],
+                [1.0, 0.5, 0.25, 0.125],
+                [0.125, 0.25, 0.5, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [0.5, 1.0, 0.5, 1.0],
+                [1.0, 0.9, 0.7, 0.3],
+                [0.3, 0.7, 0.9, 1.0],
+            ]
+            lr_ratios = random.choice(lr_patterns)
+        else:
+            # Slightly mutate existing ratios
+            for i in range(len(lr_ratios)):
+                if random.random() < 0.3:
+                    lr_ratios[i] = max(0.1, min(2.0, 
+                        lr_ratios[i] * (0.8 + 0.4 * random.random())))
+        
+        # Mutate base LR
+        base_lr = parent['base_lr'] * (0.7 + 0.6 * random.random())
+        base_lr = max(self.config['min_lr'], min(self.config['max_lr'], base_lr))
+        
+        optimizer = BacktrackingLROptimizer(child, base_lr=base_lr, 
+                                           lr_ratios=lr_ratios, config=self.config)
+        
+        return {
+            'model': child,
+            'optimizer': optimizer,
+            'base_lr': base_lr,
+            'lr_ratios': lr_ratios,
+        }
+    
+    def get_best_model(self):
+        return self.population[0]['model'] if self.population else None
+    
+    def get_population_stats(self):
+        """Get statistics about the population"""
+        accuracies = [m['accuracy'] for m in self.population]
+        base_lrs = [m['base_lr'] for m in self.population]
+        origins = [m.get('origin', 'unknown') for m in self.population]
+        aggressive_count = sum(1 for m in self.population 
+                             if m['optimizer'].aggressive_mode)
+        
+        return {
+            'size': len(self.population),
+            'generation': self.generation,
+            'avg_accuracy': sum(accuracies) / len(accuracies) if accuracies else 0,
+            'best_accuracy': max(accuracies) if accuracies else 0,
+            'worst_accuracy': min(accuracies) if accuracies else 0,
+            'avg_base_lr': sum(base_lrs) / len(base_lrs) if base_lrs else 0,
+            'aggressive_models': aggressive_count,
+            'backtrack_count': self.backtrack_count,
+            'plateau_generations': self.plateau_generations,
+            'aggressive_evolution': self.aggressive_evolution_active,
+        }
+
+# ======================
+# DATA LOADING AND NETWORK DEFINITION
+# ======================
+print("Loading MNIST dataset...")
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+train_dataset = torchvision.datasets.MNIST(
+    root='./data', train=True, transform=transform, download=True
+)
+
+train_size = int(0.8 * len(train_dataset))
+val_size = len(train_dataset) - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+
+num_workers = 0
+train_loader = torch.utils.data.DataLoader(
+    dataset=train_dataset, batch_size=128, shuffle=True, num_workers=num_workers
+)
+val_loader = torch.utils.data.DataLoader(
+    dataset=val_dataset, batch_size=128, shuffle=False, num_workers=num_workers
+)
+
+test_dataset = torchvision.datasets.MNIST(
+    root='./data', train=False, transform=transform, download=True
+)
+test_loader = torch.utils.data.DataLoader(
+    dataset=test_dataset, batch_size=128, shuffle=False, num_workers=num_workers
+)
+
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Test samples: {len(test_dataset)}")
+
+class SimpleNN(nn.Module):
+    def __init__(self, layer_config=None):
+        super(SimpleNN, self).__init__()
+        default_config = { 
+            'layer_sizes': [784, 128, 128, 128, 10],
+            'activations': ['relu', 'relu', 'relu', None]
+        }
+        config = layer_config or default_config
+        layer_sizes = config['layer_sizes']
+        activations = config['activations']
+        
+        layers = [nn.Flatten()]
+        for i in range(len(layer_sizes) - 1):
+            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
+            if activations[i]:
+                if activations[i].lower() == 'relu':
+                    layers.append(nn.ReLU())
+                elif activations[i].lower() == 'leakyrelu':
+                    layers.append(nn.LeakyReLU(0.1))
+                elif activations[i].lower() == 'sigmoid':
+                    layers.append(nn.Sigmoid())
+        
+        self.model = nn.Sequential(*layers)
+        self.config = config
+    
+    def forward(self, x):
+        return self.model(x)
+
+# ======================
+# MAIN TRAINING FUNCTION
+# ======================
+def main():
+    print("\n" + "="*60)
+    print("TREE BINDING WITH BACKTRACKING & AGGRESSIVE PLATEAU HANDLING")
+    print("="*60)
+    
+    model = SimpleNN()
+    checkpoint_manager = CheckpointManager()
+    
+    # Create optimizer for main model
+    optimizer = BacktrackingLROptimizer(
+        model, 
+        base_lr=0.001,
+        lr_ratios=[1.0, 0.8, 0.6, 0.4],
+        config=TREE_CONFIG
+    )
+    
+    tree_binding = BacktrackingTreeBindingManager(model)
+    
+    # Load checkpoint if exists
+    previous_checkpoint = checkpoint_manager.load_checkpoint(model, optimizer, ignore_optimizer=True)
+    if previous_checkpoint:
+        start_epoch = previous_checkpoint['epoch'] + 1
+        train_losses = previous_checkpoint['train_losses']
+        best_accuracy = previous_checkpoint['val_accuracy']
+        print(f"Resuming training from epoch {start_epoch}")
+    else:
+        start_epoch = 0
+        train_losses = []
+        best_accuracy = 0
+        print("No checkpoint found. Starting fresh training.")
+    
+    # Initialize tree binding
+    tree_binding.initialize_population()
+    
+    print(f"\nTree Binding Configuration:")
+    print(f"  Population: {TREE_CONFIG['num_models']} models")
+    print(f"  Keep top: {TREE_CONFIG['keep_top']} models")
+    print(f"  Backtracking: {'ENABLED' if TREE_CONFIG['backtracking_enabled'] else 'DISABLED'}")
+    print(f"  Plateau patience: {TREE_CONFIG['plateau_patience']} generations")
+    print(f"  Plateau LR factor: {TREE_CONFIG['plateau_aggressive_factor']}x (increase)")
+    print(f"  Backtracking LR factor: {TREE_CONFIG['backtracking_lr_factor']}x (decrease)")
+    
+    print(f"\nNetwork Architecture: {model.config['layer_sizes']}")
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Training setup
+    criterion = nn.CrossEntropyLoss()
+    print("\nStarting training with Backtracking Tree Binding...")
+    
+    num_epochs = 200
+    early_stop_patience = 5
+    patience_counter = 0
+    
+    for epoch in range(start_epoch, start_epoch + num_epochs):
+        epoch_start_time = datetime.now()
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch + 1}/{start_epoch + num_epochs}")
+        print(f"{'='*60}")
+        
+        # PHASE 1: Train main model
+        print("\n[Phase 1] Training main model...")
+        model.train()
+        total_loss = 0
+        batch_count = 0
+        
+        batches_to_train = 200
+        data_iter = iter(train_loader)
+        
+        for batch_idx in range(batches_to_train):
+            try:
+                images, labels = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                images, labels = next(data_iter)
+            
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            batch_count += 1
+            
+            if batch_idx % 50 == 0:
+                current_lrs = list(optimizer.get_lr_info().values())
+                avg_lr = sum(current_lrs) / len(current_lrs)
+                mode = "⚡" if optimizer.aggressive_mode else "○"
+                print(f'  {mode} Batch [{batch_idx}/{batches_to_train}], Loss: {loss.item():.4f}, Avg LR: {avg_lr:.6f}')
+        
+        avg_loss = total_loss / batch_count
+        train_losses.append(avg_loss)
+        
+        # Validate main model
+        def validate_model(model, data_loader, num_batches=100):
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                batch_iter = iter(data_loader)
+                for _ in range(num_batches):
+                    try:
+                        images, labels = next(batch_iter)
+                        outputs = model(images)
+                        _, predicted = torch.max(outputs.data, 1)
+                        total += labels.size(0)
+                        correct += (predicted == labels).sum().item()
+                    except StopIteration:
+                        break
+            return 100 * correct / total if total > 0 else 0
+        
+        val_accuracy = validate_model(model, val_loader, num_batches=100)
+        optimizer.update_performance(val_accuracy)
+        
+        print(f"\n  Main model results:")
+        print(f"    Loss: {avg_loss:.4f}, Accuracy: {val_accuracy:.2f}%")
+        print(f"    Base LR: {optimizer.base_lr:.6f}, Aggressive: {optimizer.aggressive_mode}")
+        
+        # PHASE 2: Tree Binding
+        print(f"\n[Phase 2] Tree Binding (Generation {tree_binding.generation + 1})...")
+        tree_binding.train_population_fast(train_loader, criterion)
+        tree_accuracy = tree_binding.evaluate_population(val_loader, criterion)
+        
+        print(f"\n  Tree binding results:")
+        print(f"    Best accuracy: {tree_accuracy:.2f}%")
+        stats = tree_binding.get_population_stats()
+        print(f"    Aggressive models: {stats['aggressive_models']}/{stats['size']}")
+        
+        # PHASE 3: Model comparison
+        print(f"\n[Phase 3] Model comparison...")
+        if tree_accuracy > val_accuracy:
+            print(f"  ✓ Tree binding is better! ({tree_accuracy:.2f}% vs {val_accuracy:.2f}%)")
+            print(f"  ↳ Updating main model with tree binding best")
+            model.load_state_dict(tree_binding.get_best_model().state_dict())
+            val_accuracy = tree_accuracy
+            optimizer.reset_tracking()
+        else:
+            print(f"  ✓ Main model is better ({val_accuracy:.2f}% vs {tree_accuracy:.2f}%)")
+        
+        # Check for best model
+        is_best = val_accuracy > best_accuracy
+        if is_best:
+            best_accuracy = val_accuracy
+            patience_counter = 0
+            print(f"  🎯 NEW OVERALL BEST: {best_accuracy:.2f}%")
+        else:
+            patience_counter += 1
+            print(f"  No improvement ({patience_counter}/{early_stop_patience})")
+        
+        # PHASE 4: Evolve with backtracking
+        print(f"\n[Phase 4] Evolving tree binding...")
+        tree_binding.evolve_population_with_backtracking()
+        
+        # Save checkpoint
+        checkpoint_manager.save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            train_losses=train_losses,
+            val_accuracy=val_accuracy,
+            model_config=model.config,
+            is_best=is_best
+        )
+        
+        epoch_time = (datetime.now() - epoch_start_time).total_seconds()
+        print(f"\n  Epoch {epoch + 1} completed in {epoch_time:.1f} seconds")
+        
+        # Early stopping
+        if patience_counter >= early_stop_patience:
+            print(f"\n⚠️  Early stopping triggered!")
+            print(f"Best validation accuracy: {best_accuracy:.2f}%")
+            break
+    
+    # Testing and results...
+    print("\nTesting model...")
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        batches_to_test = 200
+        batch_iter = iter(test_loader)
+        for _ in range(batches_to_test):
+            try:
+                images, labels = next(batch_iter)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+            except StopIteration:
+                break
+    
+    accuracy = 100 * correct / total
+    print(f'Test Accuracy: {accuracy:.2f}%')
+    
+    # Ensemble testing
+    print("\n" + "="*60)
+    print("TESTING TREE BINDING ENSEMBLE")
+    print("="*60)
+    
+    top_models = tree_binding.population[:3]
+    def ensemble_predict(models, images):
+        predictions = []
+        for model_info in models:
+            model = model_info['model']
+            model.eval()
+            with torch.no_grad():
+                outputs = model(images)
+                predictions.append(outputs)
+        return torch.stack(predictions).mean(dim=0)
+    
+    ensemble_correct = 0
+    ensemble_total = 0
+    
+    with torch.no_grad():
+        batches_to_test = 200
+        batch_iter = iter(test_loader)
+        for _ in range(batches_to_test):
+            try:
+                images, labels = next(batch_iter)
+                outputs = ensemble_predict(top_models, images)
+                _, predicted = torch.max(outputs.data, 1)
+                ensemble_total += labels.size(0)
+                ensemble_correct += (predicted == labels).sum().item()
+            except StopIteration:
+                break
+    
+    ensemble_accuracy = 100 * ensemble_correct / ensemble_total
+    print(f"Ensemble of top 3 tree models: {ensemble_accuracy:.2f}%")
+    
+    # Visualization
+    plt.figure(figsize=(18, 6))
+    
+    # Plot 1: Training loss
+    plt.subplot(2, 3, 1)
+    plt.plot(range(1, len(train_losses) + 1), train_losses, 'b-o', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training Loss History', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Tree binding model accuracies
+    plt.subplot(2, 3, 2)
+    accuracies = [m['accuracy'] for m in tree_binding.population]
+    colors = []
+    for model_info in tree_binding.population:
+        if model_info['optimizer'].aggressive_mode:
+            colors.append('red')
+        elif 'backtrack' in model_info['origin']:
+            colors.append('orange')
+        elif 'elite' in model_info['origin']:
+            colors.append('green')
+        elif 'mutated' in model_info['origin']:
+            colors.append('blue')
+        else:
+            colors.append('gray')
+    
+    plt.bar(range(len(accuracies)), accuracies, color=colors)
+    plt.xlabel('Model Index', fontsize=12)
+    plt.ylabel('Accuracy (%)', fontsize=12)
+    plt.title(f'Generation {tree_binding.generation + 1} Models', fontsize=14)
+    plt.axhline(y=TREE_CONFIG['keep_top'], color='red', linestyle=':', alpha=0.3)
+    plt.grid(True, alpha=0.3, axis='y')
+    
+    import matplotlib.patches as mpatches
+    legend_patches = [
+        mpatches.Patch(color='green', label='Elite'),
+        mpatches.Patch(color='blue', label='Mutated'),
+        mpatches.Patch(color='red', label='Aggressive (high LR)'),
+        mpatches.Patch(color='orange', label='Backtrack (low LR)'),
+    ]
+    plt.legend(handles=legend_patches, loc='upper right', fontsize=8)
+    
+    # Plot 3: Performance comparison
+    plt.subplot(2, 3, 3)
+    labels = ['Main Model', 'Tree Best', 'Ensemble (Top 3)']
+    accuracies = [accuracy, tree_binding.best_accuracy, ensemble_accuracy]
+    colors = ['blue', 'green', 'orange']
+    
+    bars = plt.bar(labels, accuracies, color=colors)
+    plt.ylabel('Accuracy (%)', fontsize=12)
+    plt.title('Model Comparison', fontsize=14)
+    plt.grid(True, alpha=0.3, axis='y')
+    
+    for bar, acc in zip(bars, accuracies):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                f'{acc:.2f}%', ha='center', va='bottom', fontsize=10)
+    
+    # Plot 4: Info panel
+    plt.subplot(2, 3, 4)
+    stats = tree_binding.get_population_stats()
+    info_text = (
+        f"Tree Binding Stats:\n"
+        f"  Generations: {stats['generation'] + 1}\n"
+        f"  Population: {stats['size']} models\n"
+        f"  Best Accuracy: {stats['best_accuracy']:.2f}%\n"
+        f"  Avg Accuracy: {stats['avg_accuracy']:.2f}%\n"
+        f"  Avg Base LR: {stats['avg_base_lr']:.6f}\n"
+        f"  Aggressive Models: {stats['aggressive_models']}\n"
+        f"  Backtracks: {stats['backtrack_count']}\n"
+        f"  Plateau Gens: {stats['plateau_generations']}\n\n"
+        f"LR Strategy:\n"
+        f"  Plateau → Increase LR ({TREE_CONFIG['plateau_aggressive_factor']}x)\n"
+        f"  Backtrack → Decrease LR ({TREE_CONFIG['backtracking_lr_factor']}x)"
+    )
+    plt.text(0.1, 0.5, info_text, fontsize=10, 
+            verticalalignment='center',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    plt.axis('off')
+    
+    plt.suptitle(f'Backtracking Tree Binding - Test: {accuracy:.2f}%', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
+    print(f"Main Model Accuracy: {accuracy:.2f}%")
+    print(f"Tree Binding Best: {tree_binding.best_accuracy:.2f}%")
+    print(f"Ensemble (Top 3): {ensemble_accuracy:.2f}%")
+    print(f"Tree Generations: {tree_binding.generation + 1}")
+    print(f"Backtrack Events: {tree_binding.backtrack_count}")
+    
+    stats = tree_binding.get_population_stats()
+    print(f"\nFinal Statistics:")
+    print(f"  Average Model Accuracy: {stats['avg_accuracy']:.2f}%")
+    print(f"  Best Model Accuracy: {stats['best_accuracy']:.2f}%")
+    print(f"  Average Base LR: {stats['avg_base_lr']:.6f}")
+    print(f"  Aggressive Models: {stats['aggressive_models']}/{stats['size']}")
+    print(f"  Plateau Generations: {stats['plateau_generations']}")
+    print("="*60)
+
+if __name__ == "__main__":
+    print("GOPP")
+    main()
