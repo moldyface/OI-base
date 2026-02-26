@@ -6,17 +6,17 @@ const ll MOD = 1000000007;
 mt19937 mt(time(nullptr));
 vector<ll> primes = {2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97,101,103,107,109,113,127,131,137,139,149,151,157,163,167,173,179,181,191,193,197,199};
 
-inline ll power(ll a, ll n, ll MOD) {
+ll power(ll a, ll n, ll p) {
   ll temp = 1;
   while (n) {
-      if (n & 1) temp = temp * a % MOD;
-      a = a*a % MOD, n >>= 1;
+      if (n & 1) temp = temp * a % p;
+      a = a*a % p, n >>= 1;
   }
   return temp;
 }
 
 // harmonic Division.
-inline ll val_sqrtn(ll k){
+ll val_sqrtn(ll k){
     ll bound = sqrt(k-1)+1;
     ll res = 0;
     for(ll i = 1; i < bound; i++){
@@ -281,7 +281,7 @@ ll sum_of_divisors_from_one_to_n_in_sqrt_time_complexity(ll n){
 }
 
 
-inline int linear_sieve_for_phi(){
+ll linear_sieve_for_phi(){
   vector<ll> phi(MAXN + 1, 1), sieve(MAXN + 1, -1), prefphi(MAXN + 1, 0);
     for(ll i = 2; i <= MAXN; i++)
     if(sieve[i] == -1){
@@ -304,6 +304,16 @@ inline int linear_sieve_for_phi(){
   }
   return 0;
 }
-int main(){
 
+ll sumofnumbers(ll a, ll b){
+    return ((a+b)*(a-b + 1) >> 1ll);
+}
+ll sumofsquares(ll a){
+    return (a* (a+1) * (2*a+1)) / 6;
+}
+ll sumofoddsquares(ll a){
+    return sumofsquares(a) - 4*sumofsquares(a / 2);
+}
+int main(){
+    cout << sumofoddsquares(743000);
 }
